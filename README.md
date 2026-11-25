@@ -3,7 +3,8 @@
 ## This branch: victory-amd + a DirectStorage read fix
 
 A fork of [myokex/victory-amd](https://github.com/myokex/victory-amd) at `070df42`
-with one change on top (on this fork's `victory-amd` branch, and on `fix-dstorage-guard-race`):
+with a DirectStorage fix on top (the fix alone is on `fix-dstorage-guard-race`; this fork's
+default branch, `victory-amd`, also has the shader work below):
 
 - **Kernel reads into title memory are read beside and copied in.** With the guard
   over all the views of a page (on by default in `070df42`), a raw DirectStorage
@@ -15,7 +16,8 @@ with one change on top (on this fork's `victory-amd` branch, and on `fix-dstorag
 
 ### Branch `phase2-shader-classes`: more of the title's shaders, one more pipeline
 
-On top of the fix above (get it with `git clone -b phase2-shader-classes ...`):
+On top of the fix above, in this fork's default branch (`git clone https://github.com/JoshuaO22/victory-amd`)
+and on `phase2-shader-classes`:
 
 - **Doubles and wave sums of doubles.** The translator emits `double` (through
   `makeDouble`/`splitDouble`) for `v_add_f64`, `v_mul_f64`, `v_cvt_f32_f64` and
