@@ -13,6 +13,32 @@ with one change on top (on this fork's `victory-amd` branch, and on `fix-dstorag
   write; `fread` does the same. With the fix and the guard on, a run went 5.5 minutes
   past the world's first frame without a failed request.
 
+### Branch `phase2-shader-classes`: more of the title's shaders, one more pipeline
+
+On top of the fix above (get it with `git clone -b phase2-shader-classes ...`):
+
+- **Doubles and wave sums of doubles.** The translator emits `double` (through
+  `makeDouble`/`splitDouble`) for `v_add_f64`, `v_mul_f64`, `v_cvt_f32_f64` and
+  `v_cvt_f64_f32`, and `v_permlane16/x16_b32`; the whole-wave simulation follows the
+  console compiler's expansion of a wave sum of doubles. The water passes' transmittance
+  and volumetrics compute programs translate.
+- **Descriptors read only for their size; a first half kept in a half register.** An
+  image descriptor picked by a computed index and read only for its size takes the kind
+  of a sampled load of the same table (`shortcut:` in the code); a buffer whose record
+  count the code tests takes the count from the host view; a `v_fma_mix*` result over an
+  interpolation's first half keeps 0 in the other half. Puddles, the shallow water
+  simulation and some deferred surfaces translate.
+- **No blending into targets the host cannot blend into.** The console's hardware
+  ignores blending on integer render targets (`R8_UINT`); D3D12 refuses the pipeline. It
+  is made now, with blending off there. A refused pipeline also logs its state.
+
+Over the title's shader corpus: 48 more programs translate, none fewer, all validated and
+accepted by the AMD driver. In the prologue, programs that do not translate at runtime
+went from 11 to 1, refused pipelines from 1 to 0, and a run with no controller reaches
+outdoor gameplay. Ray-traced light still does not run (shadowed areas are black), and
+frames are 350-500 ms with spikes of seconds where texture refreshes wait for the
+runtime's remapping of title memory. `cargo test --workspace`: 519 passed.
+
 Tested on one machine only: Windows 11, Radeon RX 7800 XT 16 GB (driver
 32.0.32015.7029), Ryzen 7 7700X, 32 GB RAM, Series X profile. Other GPUs,
 NVIDIA's especially, may behave differently.
