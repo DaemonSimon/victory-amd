@@ -634,11 +634,6 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let mut physical = physical();
-    // Until the pages are mapped again: `unmap` takes whole views away and
-    // maps what stays of them again, and a mapped view is a reservation
-    // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
     let pages = (!pages.is_null()).then(|| {
         // SAFETY: the title passes `n` page numbers.
         unsafe { std::slice::from_raw_parts(pages, n) }
@@ -650,21 +645,18 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
 }
 
-/// [`XMemMapPhysicalPages`] with the physical state and the remapping lock
-/// already held: unmaps `[base, base + n pages)`, then maps `pages` there
-/// (none: only unmaps). False if a page or the host fails.
+/// [`XMemMapPhysicalPages`] with the physical state held: unmaps
+/// `[base, base + n pages)`, then maps `pages` there (none: only unmaps).
+/// False if a page or the host fails.
+///
+/// Until the pages are mapped again: `unmap` takes whole views away and
+/// maps what stays of them again, and a mapped view is a reservation until
+/// it is committed. A read of title memory in place must not fall into that
+/// gap: the remapping lock is held throughout, for the addresses the change
+/// touches ([`changing`]).
+#[track_caller]
 fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
-    // Every address already showing the page asked for: nothing to change
-    // (see [`map_alias`]; the scatters map one address per call).
-    if let Some(pages) = pages
-        && (0..n).all(|i| {
-            let wanted = physical.pages.get(&pages[i]).map(|s| s.key(0));
-            wanted.is_some() && shown_at(physical, base + i * PAGE) == wanted
-        })
-    {
-        already(n);
-        return true;
-    }
+    let _changing = changing(physical, base, n * PAGE);
     unmap(physical, base, n * PAGE);
     let Some(pages) = pages else {
         return true;
@@ -693,18 +685,15 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
     true
 }
 
-/// Addresses a scatter maps under one take of the remapping lock: some
-/// 64 x 0.25 ms of kernel calls at the worst seen (mem-W3a).
-const SCATTER_CHUNK: usize = 64;
-
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (the title passes 0 for addresses to clear).
 ///
-/// The physical state is taken once for the call, the remapping lock once
-/// per [`SCATTER_CHUNK`] addresses. Taken per page, each page waited for every
-/// in-place read of title memory under way, and the texture refreshes queued
-/// behind each (run amd-F: 183 of 191 s of texture preparation waiting for
-/// title memory to hold still). Each address is still mapped on its own:
+/// The physical state is taken once for the call; the remapping lock per
+/// address, for that address alone ([`changing`]). Taken once for the whole
+/// call it was held up to 1.95 s (run mem-W3a), and every texture refresh
+/// waited; taken per page when it covered all title memory, each page
+/// waited for every in-place read under way and the refreshes queued behind
+/// each (run amd-F). Each address is mapped on its own:
 /// addresses that follow one another can lie in different placeholders,
 /// which one view cannot span (run amd-H: error 487, and the title stopped).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
@@ -719,19 +708,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`, for a chunk of addresses at a time:
-    // held for a whole call of thousands of pages, the texture refreshes
-    // stood waiting up to 1.4 s (run mem-W0); taken per page, they queued
-    // behind each page (amd-F). Between chunks, what title memory shows is
-    // the title's own mid-call state, page by page.
-    let mut changing = Some(victory_gpu::title_memory_remapping());
     for (i, &address) in addresses.iter().enumerate() {
-        if i > 0 && i % SCATTER_CHUNK == 0 {
-            drop(changing.take());
-            // A chance for the reads waiting on the lock to have it.
-            std::thread::yield_now();
-            changing = Some(victory_gpu::title_memory_remapping());
-        }
         let page = pages.map(|p| &p[i..=i]).filter(|p| p[0] != 0);
         if !map_pages(&mut physical, address as usize, 1, page) {
             return 0;
@@ -745,87 +722,55 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`):
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
-///
-/// A page of `to` that already shows the page asked for stays as it is:
-/// the title maps the same pool pages to the same tiled addresses again and
-/// again, and each unmap and map is a kernel call made under the remapping
-/// lock, which the texture refreshes wait behind (run mem-W3a: some 470 ms
-/// of kernel calls a second, against 7 ms of our own bookkeeping). The
-/// pages that do change are unmapped run by run, then mapped one by one.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
-    if from == 0 {
-        unmap(&mut physical, to, len);
-        return true;
-    }
-    let n = len.div_ceil(PAGE);
-    let wanted: Vec<Option<Slice>> = (0..n).map(|k| slice_at(&physical, from + k * PAGE)).collect();
-    let same = |physical: &Physical, k: usize| {
-        wanted[k]
-            .as_ref()
-            .is_some_and(|s| shown_at(physical, to + k * PAGE) == Some(s.key(0)))
-    };
-    let mut k = 0;
-    while k < n {
-        if same(&physical, k) {
-            already(1);
-            k += 1;
-            continue;
+    // As in `map_pages`: no read in place meets the gap.
+    let _changing = changing(&physical, to, len);
+    unmap(&mut physical, to, len);
+    for k in (0..len).step_by(PAGE) {
+        if from == 0 {
+            break;
         }
-        let start = k;
-        while k < n && !same(&physical, k) {
-            k += 1;
-        }
-        unmap(&mut physical, to + start * PAGE, (k - start) * PAGE);
-        for j in start..k {
-            let Some(slice) = wanted[j].clone() else {
-                // As before: what is left of the range shows nothing.
-                unmap(&mut physical, to + j * PAGE, (n - j) * PAGE);
-                return false;
-            };
-            if !map(&mut physical, to + j * PAGE, PAGE, slice) {
-                return false;
-            }
+        let at = from + k;
+        let Some(slice) = physical
+            .views
+            .range(..=at)
+            .next_back()
+            .filter(|(base, (size, _))| at < *base + size)
+            .map(|(base, (_, s))| Slice {
+                index: s.index + (at - base) / PAGE,
+                section: s.section.clone(),
+            })
+        else {
+            return false;
+        };
+        if !map(&mut physical, to + k, PAGE, slice) {
+            return false;
         }
     }
     true
 }
 
-/// What the view holding `at` shows there, if one does.
-fn slice_at(physical: &Physical, at: usize) -> Option<Slice> {
-    physical
-        .views
-        .range(..=at)
-        .next_back()
-        .filter(|(base, (size, _))| at < *base + size)
-        .map(|(base, (_, s))| Slice {
-            index: s.index + (at - base) / PAGE,
-            section: s.section.clone(),
-        })
+/// The remapping lock (`victory_gpu::title_memory_remapping_range`) for a
+/// change of `[base, base + len)`: those addresses and the whole of the
+/// views reaching past them, which `unmap` takes away and maps again in
+/// part. Reads of title memory elsewhere go on meanwhile.
+#[track_caller]
+fn changing(physical: &Physical, base: usize, len: usize) -> victory_gpu::Remapping {
+    let end = base.saturating_add(len);
+    let holding = |at: usize| {
+        physical
+            .views
+            .range(..=at)
+            .next_back()
+            .filter(|(start, (size, _))| at < *start + size)
+            .map(|(start, (size, _))| (*start, *start + size))
+    };
+    let lo = holding(base).map_or(base, |(start, _)| start.min(base));
+    let hi = if len == 0 { end } else { holding(end - 1).map_or(end, |(_, stop)| stop.max(end)) };
+    victory_gpu::title_memory_remapping_range(lo, (hi - lo).max(1))
 }
-
-/// The page shown at `at` ([`Slice::key`]), if one is.
-fn shown_at(physical: &Physical, at: usize) -> Option<(usize, usize)> {
-    physical
-        .views
-        .range(..=at)
-        .next_back()
-        .filter(|(base, (size, _))| at < *base + size)
-        .map(|(base, (_, s))| s.key((at - base) / PAGE))
-}
-
-/// Counts pages left as they were, already showing what was asked for
-/// (diagnostics; logged with [`REMAP_TIME`]).
-fn already(_pages: usize) {
-    #[cfg(feature = "diagnostics")]
-    ALREADY.fetch_add(_pages as u64, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(feature = "diagnostics")]
-static ALREADY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Diagnostics: where the time under the remapping lock goes, since the last
 /// line: [unmaps, their µs, kernel maps (placeholder split, view, commit),
@@ -857,13 +802,12 @@ fn remap_time_line() {
     *last = Some(now);
     let [unmaps, unmap_us, maps, map_us, books] = [0, 1, 2, 3, 4].map(|i| REMAP_TIME[i].swap(0, Relaxed));
     tracing::info!(
-        "remapping work per second over {secs:.0} s: {:.0} unmaps {:.1} ms, {:.0} kernel maps {:.1} ms, {:.1} ms of our bookkeeping after them; {:.0} pages left as they were (already showing what was asked)",
+        "remapping work per second over {secs:.0} s: {:.0} unmaps {:.1} ms, {:.0} kernel maps {:.1} ms,          {:.1} ms of our bookkeeping after them",
         unmaps as f64 / secs,
         unmap_us as f64 / 1e3 / secs,
         maps as f64 / secs,
         map_us as f64 / 1e3 / secs,
         books as f64 / 1e3 / secs,
-        ALREADY.swap(0, Relaxed) as f64 / secs,
     );
 }
 
@@ -1334,19 +1278,6 @@ mod tests {
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
-        // Asked again: the page already shows it and stays.
-        assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
-        // SAFETY: mapped read-write.
-        assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
-        // Another page in its place.
-        assert!(map_alias(b as u64, a as u64, PAGE as u64));
-        // SAFETY: mapped read-write.
-        assert_eq!(unsafe { b.cast::<u8>().read() }, 1);
-        // The same page scattered where it already shows: left as it is.
-        let shown = [at(a, 2)];
-        assert_eq!(XMemMapPhysicalPagesScatter(shown.as_ptr(), 1, pages[2..].as_ptr()), 1);
-        // SAFETY: mapped read-write.
-        assert_eq!(unsafe { at(a, 2).cast::<u8>().read() }, 7);
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
