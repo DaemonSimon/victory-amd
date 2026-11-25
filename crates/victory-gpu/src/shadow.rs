@@ -1438,13 +1438,13 @@ fn keeps() -> bool {
 
 /// Bytes of the snapshots kept, and the most that may be.
 static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
-/// `VICTORY_KEEP_SNAPSHOTS_MB`, 256 unless set (it was 768: run 80, with
+/// `VICTORY_KEEP_SNAPSHOTS_MB`, 1024 unless set (256 before; it was 768: run 80, with
 /// kept snapshots beside copies in the card's memory, ran the PC out of
 /// memory in 27 s; kept snapshots are the PC's memory, all of it resident).
 fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
     })
 }
 
@@ -1831,9 +1831,22 @@ impl Shadow {
                     let (lo, hi) = self.piece(piece);
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
-                    // SAFETY: as below; `hi <= total`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                    if wide_back() {
+                        // Taken with the submission's other snapshots on
+                        // several threads (`take_snapshots`), before its
+                        // lists go to the card; a declared range is left
+                        // alone by every refresh until then.
+                        let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+                        let (data, snap) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+                        match snaps.last_mut() {
+                            Some(last) if last.0 + last.2 == data + lo && last.1 + last.2 == snap + lo => last.2 += hi - lo,
+                            _ => snaps.push((data + lo, snap + lo, hi - lo)),
+                        }
+                    } else {
+                        // SAFETY: as below; `hi <= total`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        }
                     }
                     kept.0[piece] = whole;
                 }
