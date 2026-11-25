@@ -560,7 +560,9 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    // The state too: the shaders alone make a pipeline
+                    // with another state (`victory translate` pairs).
+                    tracing::warn!(error = %e, ?shaders, state = %state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -666,7 +668,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, state = %state, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
