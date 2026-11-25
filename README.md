@@ -44,7 +44,7 @@ runtime's remapping of title memory. `cargo test --workspace`: 519 passed.
 From [skornuta/victory-frametime](https://github.com/skornuta/victory-frametime) (GPL-3.0, as
 upstream), on branch `frametime-dump`. Build first: `cargo build --release -p victory`.
 Run with `VICTORY_FRAMETIME_DUMP=1` and the CSV is at
-`%LOCALAPPDATA%ictory\cacherametime.csv` (`victory config` prints `cache_dir`); or name
+`%LOCALAPPDATA%\victory\cache\frametime.csv` (`victory config` prints `cache_dir`); or name
 the file: `VICTORY_FRAMETIME_DUMP=<path>` (its folder must exist). The log prints
 `frametime dump path=...` when the first frame lands. One row per ~1 s: time per frame and
 its parts (preparing, copies, textures, GPU, copy-back), the worst and average single
