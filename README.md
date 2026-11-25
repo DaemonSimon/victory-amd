@@ -28,7 +28,7 @@ translated on your machine from your own copy of the game.
 2. Get the code and set up the config:
 
    ```powershell
-   git clone https://github.com/JoshuaO22/victory-amd
+   git clone https://github.com/JoshuuDev/victory-amd
    cd victory-amd
    copy victory.example.toml victory.toml   # set game_dir to your own dump, outside the repo
    cargo test --workspace                   # optional; needs no game data
