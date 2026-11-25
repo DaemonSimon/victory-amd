@@ -16,7 +16,7 @@ default branch, `victory-amd`, also has the shader work below):
 
 ### Branch `phase2-shader-classes`: more of the title's shaders, one more pipeline
 
-On top of the fix above, in this fork's default branch (`git clone https://github.com/JoshuaO22/victory-amd`)
+On top of the fix above, in this fork's default branch (`git clone https://github.com/JoshuuDev/victory-amd`)
 and on `phase2-shader-classes`:
 
 - **Doubles and wave sums of doubles.** The translator emits `double` (through
@@ -56,7 +56,7 @@ translated on your machine from your own copy of the game.
 2. Get the code and set up the config:
 
    ```powershell
-   git clone https://github.com/JoshuaO22/victory-amd
+   git clone https://github.com/JoshuuDev/victory-amd
    cd victory-amd
    copy victory.example.toml victory.toml   # set game_dir to your own dump, outside the repo
    cargo test --workspace                   # optional; needs no game data
