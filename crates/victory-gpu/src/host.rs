@@ -294,6 +294,14 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// For the frametime dump's worst frame (`crate::frametime`): the running
+/// µs of preparing, waiting for the card, copies, textures and copying back,
+/// as they stand (the frame summary resets them each interval).
+pub(crate) fn frame_parts() -> [u64; 5] {
+    let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    [get(&SUBMISSION_US[0]), get(&SUBMISSION_US[1]), get(&PREPARING[0]), get(&PREPARING[2]), get(&COPY_BACK[0])]
+}
+
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
 /// that while the thread that holds the submission lock was working (the
@@ -5773,6 +5781,8 @@ impl Meter {
         // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
         // buckets above and the worst/mean frame measured at each present.
         let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+        // Every counter the worst frame follows has been reset above.
+        crate::frametime::counters_reset();
         crate::frametime::record(&crate::frametime::Row {
             frame: crate::queue::frame_count(),
             frames,
@@ -5857,10 +5867,12 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
-                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
+                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms; \
+                 askings of view memory left out since the last line: {}",
                 slow[0] as f64 / frames,
                 slow[1] as f64 / 1e3 / frames,
-                slow[2] as f64 / 1e3
+                slow[2] as f64 / 1e3,
+                crate::watch::VIEW_ASKS_SKIPPED.swap(0, Ordering::Relaxed)
             );
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;

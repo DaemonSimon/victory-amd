@@ -10,6 +10,22 @@
 //! the first row.
 //! This is deliberately release-buildable (no `diagnostics` feature): the
 //! frames it is meant to explain are the slow ones.
+//!
+//! After those columns, each row has:
+//! - **The worst frame's own parts** (`worst_*`): the running totals of
+//!   [`PART_NAMES`] are read at every present, and the parts of the slowest
+//!   frame of the interval are kept, so a 2 s frame is not averaged with
+//!   the short ones beside it. `worst_unaccounted_ms` is that frame less
+//!   our preparing, our wait for the card and the heap pass: roughly the
+//!   title's own time (its threads, its waits) and the parts of ours not
+//!   timed (recording its command lists). Parts run on several threads and
+//!   may overlap, so it is a guide, not a sum.
+//! - **Memory waits and work, per frame:** texture refreshes waiting for
+//!   title memory to hold still, the remapping lock held (and how often),
+//!   host copies made (count, MB, ms).
+//! - **Memory state:** page faults per second (soft and hard: the
+//!   process's count), the system's commit left, the card's memory in use
+//!   and its budget.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -98,7 +114,11 @@ cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,\
 copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
 texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
 card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
-twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct\n";
+twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,\
+worst_frame_ms,worst_prepare_ms,worst_gpu_ms,worst_copies_ms,worst_textures_ms,worst_copyback_ms,\
+worst_heap_ms,worst_texture_lock_wait_ms,worst_card_wait_ms,worst_remap_held_ms,worst_host_copies_ms,\
+worst_unaccounted_ms,texture_lock_wait_ms,remap_held_ms,remaps,host_copies,host_copies_mb,host_copies_ms,\
+page_faults_per_s,commit_left_mb,card_used_mb,card_budget_mb\n";
 
 /// The `#` block a dump starts with: the machine and the switches, so a file
 /// from another PC can be compared and reproduced. `pandas.read_csv(...,
@@ -287,6 +307,69 @@ fn nvidia_driver_number(windows: &str) -> Option<String> {
     Some(format!("{}.{}", &tail[..3], &tail[3..]))
 }
 
+/// The parts a frame is broken into, as running totals in µs
+/// ([`read_parts`]). The first [`SWAPPED`] are counters the frame summary
+/// resets each interval ([`counters_reset`]); the rest are this module's.
+#[allow(dead_code)] // names for the columns, kept beside the parts
+const PART_NAMES: [&str; PARTS] = [
+    "prepare",
+    "gpu",
+    "copies",
+    "textures",
+    "copyback",
+    "heap",
+    "texture_lock_wait",
+    "card_wait",
+    "remap_held",
+    "host_copies",
+];
+const PARTS: usize = 10;
+const SWAPPED: usize = 8;
+
+/// This module's own running totals: [remapping lock held µs, times taken,
+/// host copies made, their bytes, µs making them].
+static MEMORY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// The runtime held the remapping lock `us` µs (`crate::watch`).
+pub(crate) fn remap_held(us: u64) {
+    MEMORY[0].fetch_add(us, Ordering::Relaxed);
+    MEMORY[1].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A host copy of `bytes` was made in `us` µs (`crate::shadow`): the
+/// allocation, and the card's buffer if it has one.
+pub(crate) fn host_copy_made(bytes: u64, us: u64) {
+    MEMORY[2].fetch_add(1, Ordering::Relaxed);
+    MEMORY[3].fetch_add(bytes, Ordering::Relaxed);
+    MEMORY[4].fetch_add(us, Ordering::Relaxed);
+}
+
+fn read_parts() -> [u64; PARTS] {
+    let [prepare, gpu, copies, textures, copyback] = crate::host::frame_parts();
+    [
+        prepare,
+        gpu,
+        copies,
+        textures,
+        copyback,
+        crate::draw::HEAP_BUFFER_MICROS.load(Ordering::Relaxed),
+        crate::texture::REFRESH_WAITS[2].load(Ordering::Relaxed),
+        crate::shadow::card_wait_us(),
+        MEMORY[0].load(Ordering::Relaxed),
+        MEMORY[4].load(Ordering::Relaxed),
+    ]
+}
+
+/// Per frame: where the running totals stood at the last present, the
+/// worst frame of the interval (µs) and its parts, and the parts summed
+/// over the interval.
+struct Parts {
+    mark: [u64; PARTS],
+    worst: (u64, [u64; PARTS]),
+    sums: [u64; PARTS],
+}
+static FRAME_PARTS: Mutex<Parts> = Mutex::new(Parts { mark: [0; PARTS], worst: (0, [0; PARTS]), sums: [0; PARTS] });
+
 /// Times one presented frame. Called for every present, before the frame
 /// summary's own one-second gate, so a slow frame is seen even when the
 /// summary is not printed.
@@ -296,13 +379,111 @@ pub(crate) fn tick() {
     }
     let now = Instant::now();
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let parts = read_parts();
+    let mut p = FRAME_PARTS.lock().unwrap_or_else(|e| e.into_inner());
+    // What each part grew by since the last present (a counter the
+    // summary reset since starts again from 0: see `counters_reset`).
+    let mut grew = [0u64; PARTS];
+    for i in 0..PARTS {
+        grew[i] = parts[i].saturating_sub(p.mark[i]);
+        p.sums[i] += grew[i];
+    }
+    p.mark = parts;
     if let Some(previous) = *last {
         let micros = now.duration_since(previous).as_micros() as u64;
         MAX_US.fetch_max(micros, Ordering::Relaxed);
         SUM_US.fetch_add(micros, Ordering::Relaxed);
         COUNT.fetch_add(1, Ordering::Relaxed);
+        if micros > p.worst.0 {
+            p.worst = (micros, grew);
+        }
     }
     *last = Some(now);
+}
+
+/// The frame summary has just reset its counters (the first [`SWAPPED`]
+/// parts): they count from 0 again.
+pub(crate) fn counters_reset() {
+    if !enabled() {
+        return;
+    }
+    let mut p = FRAME_PARTS.lock().unwrap_or_else(|e| e.into_inner());
+    p.mark[..SWAPPED].fill(0);
+}
+
+/// The columns after the summary's: the worst frame's parts, memory waits
+/// and work per frame, memory state. `frames`: frames in the interval;
+/// `secs`: its length.
+fn memory_columns(frames: f64, secs: f64) -> String {
+    let (worst, sums) = {
+        let mut p = FRAME_PARTS.lock().unwrap_or_else(|e| e.into_inner());
+        let worst = std::mem::replace(&mut p.worst, (0, [0; PARTS]));
+        (worst, std::mem::replace(&mut p.sums, [0; PARTS]))
+    };
+    static TAKEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let since = |i: usize, now: u64| now.saturating_sub(TAKEN[i].swap(now, Ordering::Relaxed));
+    let remaps = since(0, MEMORY[1].load(Ordering::Relaxed));
+    let copies = since(1, MEMORY[2].load(Ordering::Relaxed));
+    let copy_bytes = since(2, MEMORY[3].load(Ordering::Relaxed));
+    let ms = |us: u64| us as f64 / 1e3;
+    let (frame_us, w) = worst;
+    // Preparing, the wait for the card and the heap pass: the parts that
+    // stand in a frame's way (copies and textures are inside preparing).
+    let ours = w[0] + w[1] + w[5];
+    let frames = frames.max(1.0);
+    let (faults, commit_left) = memory_state(secs);
+    let card = crate::host::host().and_then(|h| h.video_memory());
+    let mut out = format!("{:.3}", ms(frame_us));
+    for &us in &w {
+        out.push_str(&format!(",{:.3}", ms(us)));
+    }
+    out.push_str(&format!(
+        ",{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.0},{:.0},{:.0},{:.0}",
+        ms(frame_us.saturating_sub(ours)),
+        ms(sums[6]) / frames,
+        ms(sums[8]) / frames,
+        remaps as f64 / frames,
+        copies as f64 / frames,
+        copy_bytes as f64 / 1e6 / frames,
+        ms(sums[9]) / frames,
+        faults,
+        commit_left,
+        card.map_or(0.0, |c| c[1] as f64 / 1e6),
+        card.map_or(0.0, |c| c[0] as f64 / 1e6),
+    ));
+    out
+}
+
+/// Page faults per second since the last call (the process's, soft and
+/// hard) and the system's commit left, in MB. Zeros off Windows.
+fn memory_state(secs: f64) -> (f64, f64) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        static FAULTS: AtomicU64 = AtomicU64::new(u64::MAX);
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        let faults = if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0 {
+            let now = u64::from(c.PageFaultCount);
+            let before = FAULTS.swap(now, Ordering::Relaxed);
+            if before == u64::MAX || secs <= 0.0 { 0.0 } else { now.saturating_sub(before) as f64 / secs }
+        } else {
+            0.0
+        };
+        let mut info = PERFORMANCE_INFORMATION { cb: size_of::<PERFORMANCE_INFORMATION>() as u32, ..Default::default() };
+        // SAFETY: a sized structure the call fills in.
+        let left = if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0 {
+            info.CommitLimit.saturating_sub(info.CommitTotal) as f64 * info.PageSize as f64 / 1e6
+        } else {
+            0.0
+        };
+        return (faults, left);
+    }
+    #[allow(unreachable_code)]
+    (0.0, 0.0)
 }
 
 /// The worst and average frame in the interval, in milliseconds, and how
@@ -369,6 +550,8 @@ pub(crate) fn record(r: &Row) {
     let t_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
+    // Before the file's lock: it asks the system and the card.
+    let memory = memory_columns(r.frames, if r.fps > 0.0 { r.frames / r.fps } else { 0.0 });
     let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
     let _ = writeln!(
         file,
@@ -379,7 +562,7 @@ pub(crate) fn record(r: &Row) {
          {texture_refresh_ms:.3},{card_passes:.3},{card_compares:.3},{card_sent_mb:.3},\
          {card_ranges:.3},{card_pieces:.3},{card_fetched:.3},{card_fetched_mb:.3},\
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
-         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3}",
+         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3},{memory}",
         frame = r.frame,
         frames = r.frames,
         fps = r.fps,

@@ -166,6 +166,12 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// The µs waited for the card's copies' pieces so far ([`CARD_STATS`]
+/// place 6), for the frametime dump's worst frame.
+pub(crate) fn card_wait_us() -> u64 {
+    CARD_STATS[6].load(Ordering::Relaxed)
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {
@@ -2789,6 +2795,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // Timed for the frametime dump (`crate::frametime::host_copy_made`).
+        let making = std::time::Instant::now();
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -2827,6 +2835,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
+        crate::frametime::host_copy_made(size, making.elapsed().as_micros() as u64);
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
@@ -3010,6 +3019,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // Timed for the frametime dump (`crate::frametime::host_copy_made`).
+    let making = std::time::Instant::now();
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -3035,6 +3046,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         len,
         "loose memory copied to the host"
     );
+    crate::frametime::host_copy_made(len, making.elapsed().as_micros() as u64);
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;

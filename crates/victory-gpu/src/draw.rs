@@ -339,6 +339,37 @@ fn catching_up(more: std::time::Duration) -> bool {
 /// read stale.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+/// Diagnostics: one line for a pass over the heap's buffer views that took
+/// over 250 ms, saying where the time went. Frames over a second follow
+/// these passes (runs mem-W3c and viwork-A: the pass's median is 0.8-1.5 s
+/// in seconds holding such a frame, 27-47 ms in the others), and nothing
+/// else told which part of it. `n`: slots walked, whether all of them
+/// (every 16 passes), µs making slots (`mirror`), µs finding their copies
+/// (`buffer_copy`), copies refreshed, their MB.
+#[cfg(feature = "diagnostics")]
+fn slow_heap_pass(
+    all: std::time::Duration,
+    walked: std::time::Duration,
+    refreshed: std::time::Duration,
+    n: [usize; 6],
+) {
+    if all.as_millis() < 250 {
+        return;
+    }
+    let [slots, full, mirror_us, copy_us, copies, mb] = n;
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    tracing::info!(
+        "slow heap pass: {:.0} ms: slot walk {:.0} ms over {slots} slots{} (making slots {:.0} ms, finding their copies {:.0} ms); {copies} copies {mb} MB queued for refresh {:.0} ms; heap textures {:.0} ms",
+        ms(all),
+        ms(walked),
+        if full == 1 { ", all of them" } else { "" },
+        mirror_us as f64 / 1e3,
+        copy_us as f64 / 1e3,
+        ms(refreshed) - ms(walked),
+        ms(all) - ms(refreshed),
+    );
+}
+
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
@@ -1366,12 +1397,24 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        // Diagnostics: where a slow pass goes (`slow_heap_pass`).
+        #[cfg(feature = "diagnostics")]
+        let full = (*passes - 1) % 16 == 0; // counted just above
+        #[cfg(feature = "diagnostics")]
+        let (mut mirror_us, mut copy_us) = (0u64, 0u64);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            #[cfg(feature = "diagnostics")]
+            let asked = std::time::Instant::now();
+            let view = host.mirror(index, handle, true);
+            #[cfg(feature = "diagnostics")]
+            {
+                mirror_us += asked.elapsed().as_micros() as u64;
+            }
+            let Some(view) = view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1391,7 +1434,14 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            #[cfg(feature = "diagnostics")]
+            let asked = std::time::Instant::now();
+            let copy = crate::descriptor::host::buffer_copy(&view);
+            #[cfg(feature = "diagnostics")]
+            {
+                copy_us += asked.elapsed().as_micros() as u64;
+            }
+            let Some((shadow, address, len)) = copy else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1401,6 +1451,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        #[cfg(feature = "diagnostics")]
+        let walked = started.elapsed();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1444,7 +1496,16 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        #[cfg(feature = "diagnostics")]
+        let refreshed = started.elapsed();
         self.heap_textures(list, heap, host);
+        #[cfg(feature = "diagnostics")]
+        slow_heap_pass(
+            started.elapsed(),
+            walked,
+            refreshed,
+            [slots.len(), usize::from(full), mirror_us as usize, copy_us as usize, spans.len(), (bytes >> 20) as usize],
+        );
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
