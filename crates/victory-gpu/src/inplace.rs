@@ -335,6 +335,25 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
+/// Whether any title view overlaps `[start, end)`: [`views_between`]
+/// without making the list. The write watch asks this of every range it
+/// refreshes (`crate::watch::has_views`), and the world's large buffers lie
+/// over thousands of views: listing them all to see whether there was one
+/// was 8% of the submitting thread at the user's pause menu (run manual-C's
+/// capture), most of its list-growing time with it.
+pub(crate) fn any_view_between(start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let v = views();
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base + bytes > start
+    {
+        return true;
+    }
+    v.views.range(start.saturating_add(1)..end).next().is_some()
+}
+
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
@@ -1149,6 +1168,39 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// `any_view_between` says yes exactly where `views_between` lists a view:
+    /// a view that starts before the range and reaches into it, one inside it,
+    /// and nothing over the gaps and past the end.
+    #[test]
+    fn any_view_agrees_with_the_list_of_views() {
+        let at = 0x7_8000_0000usize;
+        title_memory_view(at, 2 * K64, 78, 0);
+        title_memory_view(at + 4 * K64, K64, 78, 4 * K64 as u64);
+        for (start, end) in [
+            (at, at + K64),
+            (at + K64, at + 3 * K64),
+            (at + 2 * K64, at + 4 * K64),
+            (at + 2 * K64, at + 5 * K64),
+            (at + 3 * K64, at + 4 * K64 + 1),
+            (at + 5 * K64, at + 8 * K64),
+            (at - K64, at),
+            (at - K64, at + 1),
+            (at + K64, at + K64),
+        ] {
+            assert_eq!(
+                any_view_between(start, end),
+                !views_between(start, end).is_empty(),
+                "{:#x}..{:#x}",
+                start,
+                end
+            );
+        }
+        assert!(!any_view_between(at + 2 * K64, at + 4 * K64));
+        assert!(any_view_between(at + K64, at + K64 + 1));
+        views_gone(at, 8 * K64);
+        assert!(!any_view_between(at, at + 8 * K64));
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

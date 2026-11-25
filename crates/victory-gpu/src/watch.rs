@@ -107,7 +107,7 @@ fn unlocked<T>(mut j: Held, first: usize, last: usize, ask: impl FnOnce() -> T) 
 /// after walking it. Views are told to us as they are mapped and unmapped
 /// (`crate::inplace`), so the asking is left out for them.
 fn has_views(first: usize, last: usize) -> bool {
-    !crate::inplace::views_between(first * PAGE, last * PAGE).is_empty()
+    crate::inplace::any_view_between(first * PAGE, last * PAGE)
 }
 
 /// Askings left out because the range held views ([`has_views`]), since
@@ -492,11 +492,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    // Counted first, without a list: nearly every range is all clean, and
+    // making the list for it was a list of up to thousands of blocks per
+    // refresh (run manual-C's capture).
+    if g.clean.range(first..last).count() == last - first {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
